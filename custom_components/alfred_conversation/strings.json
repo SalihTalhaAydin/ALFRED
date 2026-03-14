@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to ALFRED",
+        "description": "Enter the URL where ALFRED is running.",
+        "data": {
+          "base_url": "ALFRED Base URL",
+          "chat_model": "Chat Model"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to ALFRED at the given URL. Make sure it is running."
+    }
+  }
+}

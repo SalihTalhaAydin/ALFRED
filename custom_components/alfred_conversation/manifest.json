@@ -1,0 +1,10 @@
+{
+  "domain": "alfred_conversation",
+  "name": "ALFRED Conversation",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/alsal/ALFRED",
+  "iot_class": "cloud_polling",
+  "requirements": ["openai>=1.30.0"],
+  "version": "1.0.0"
+}

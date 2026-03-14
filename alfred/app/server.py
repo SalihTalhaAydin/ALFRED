@@ -84,11 +84,11 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     else:
         messages.insert(0, {"role": "system", "content": alfred_context})
 
-    # Forward to Claude via LiteLLM -- always streaming
+    stream = body.get("stream", True)
     completion_kwargs: dict = {
         "model": model,
         "messages": messages,
-        "stream": True,
+        "stream": stream,
     }
     if tools:
         completion_kwargs["tools"] = tools
@@ -102,7 +102,16 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             status=502,
         )
 
-    # Stream SSE back to Custom Conversation
+    if not stream:
+        result = response.model_dump(exclude_none=True)
+        full_content = ""
+        if result.get("choices"):
+            msg = result["choices"][0].get("message", {})
+            full_content = msg.get("content", "")
+        if user_msg and full_content:
+            asyncio.create_task(memory.store(user_msg["content"], full_content))
+        return web.json_response(result)
+
     sse = web.StreamResponse(
         headers={
             "Content-Type": "text/event-stream",
@@ -126,7 +135,6 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
     finally:
         await sse.write(b"data: [DONE]\n\n")
 
-    # Store conversation for memory extraction (background)
     if user_msg and full_content:
         asyncio.create_task(memory.store(user_msg["content"], full_content))
 
