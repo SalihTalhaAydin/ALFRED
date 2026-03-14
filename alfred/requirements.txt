@@ -1,0 +1,5 @@
+hass-client
+litellm
+openai
+aiosqlite
+python-dotenv
