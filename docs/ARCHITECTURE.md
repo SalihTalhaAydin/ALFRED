@@ -20,9 +20,52 @@ Home Assistant already handles device control brilliantly. What it lacks is the 
 
 ALFRED is a lightweight AI layer for Home Assistant. It adds persistent memory, a butler personality, and proactive monitoring to HA's existing voice assistant infrastructure.
 
-It runs as a Home Assistant add-on: a streaming HTTP proxy between HA's conversation pipeline and Anthropic's Claude API, plus a background event monitor that watches for notable events and speaks through your home speakers.
+It runs as two components:
 
-**4 Python files. ~750 lines. Everything else is delegated to Home Assistant.**
+1. **ALFRED Server** (`alfred/app/`): A streaming HTTP proxy between HA's conversation pipeline and Anthropic's Claude API, plus a background event monitor.
+2. **`alfred_conversation` Custom Component** (`custom_components/alfred_conversation/`): A Home Assistant integration that bridges HA's Assist pipeline to ALFRED's OpenAI-compatible API. This component lives inside HA Core's process and handles the conversation agent registration, tool execution loop, and Assist API integration.
+
+**4 Python files for the server (~750 lines). 6 files for the custom component (~350 lines). Everything else is delegated to Home Assistant.**
+
+---
+
+## How It Actually Works (End-to-End)
+
+```
+User speaks
+    |
+    v
+HA Assist Pipeline (STT)
+    |
+    v
+alfred_conversation custom component (inside HA Core)
+    |  1. Gathers HA's Assist tools (HassTurnOn, HassSetTemperature, etc.)
+    |  2. Builds system prompt from HA's LLM API (entity list, tool instructions)
+    |  3. Sends: POST /v1/chat/completions (OpenAI format, stream=false)
+    v
+ALFRED server.py (port 8099)
+    |  1. Finds user message in the request
+    |  2. Recalls relevant memories from SQLite (cosine similarity on embeddings)
+    |  3. Prepends: ALFRED persona + home layout + recalled facts to system prompt
+    |  4. Forwards to Claude Sonnet via LiteLLM (stream=false)
+    |  5. Returns JSON response to custom component
+    |  6. Stores conversation in background for future fact extraction
+    v
+Claude Sonnet API (Anthropic)
+    |  Returns: text and/or tool_calls (e.g., HassTurnOn)
+    v
+alfred_conversation custom component
+    |  If tool_calls: executes them via HA's llm.async_call_tool(), appends results, loops back
+    |  If text only: done
+    v
+HA Assist Pipeline (TTS) -> Speaker
+
+Separately (runs independently):
+ALFRED monitor.py
+    |  Connects to HA via hass-client WebSocket
+    |  Subscribes to state_changed events
+    |  Announces via tts.speak on notable events
+```
 
 ---
 
@@ -51,13 +94,33 @@ Anthropic doesn't offer an embeddings API. For semantic memory recall, we need v
 - The HA add-on base images ship with Python pre-installed.
 - TypeScript would work (Home Mind proves it) but adds Node.js to the container and loses access to the best HA client libraries.
 
-### Why an HA Add-on (Not a Custom Component)
+### Why a Custom Component (The Architecture Pivot)
 
-Two options existed:
-- **Custom component** (`custom_components/alfred/`): runs inside HA Core's process. Full access to HA internals, but must follow HA's integration patterns (~800+ lines of boilerplate), handle the Assist API tool execution loop ourselves, and can't run long-lived background tasks easily.
-- **Add-on** (`/addons/alfred/`): runs as a separate Docker container. Independent process lifecycle, own dependencies, own Python version. Communicates with HA via API.
+The original plan was to use a third-party HACS integration (Custom Conversation by michelle-avery) as the bridge between HA's Assist pipeline and ALFRED. This failed because:
 
-The add-on wins because ALFRED's proactive monitor needs to run continuously in the background, independent of conversation sessions. Add-ons are designed for this. Custom components are designed for request-response integrations.
+1. **HA's built-in `openai_conversation` integration** doesn't expose a `base_url` configuration option. It always connects to OpenAI's servers. Can't redirect to ALFRED.
+2. **Third-party HACS bridges** like `custom-conversation` or `openai-compatible-conversation` were either abandoned, incompatible with HA 2026.3.0, or caused Python 3.14 import errors.
+
+The solution: build a minimal custom component (`alfred_conversation`) that is a stripped-down version of HA's own `openai_conversation` integration, but with explicit `base_url` configuration pointing to ALFRED's server.
+
+**This gives us:**
+- Full control over the bridge code, no dependency on third-party maintainers
+- Explicit `base_url` config to point at ALFRED's HTTP server
+- HA handles STT/TTS, entity exposure, and the Assist tool definitions
+- The custom component handles the agentic tool execution loop (max 10 iterations)
+- ALFRED's server handles persona, memory injection, and LLM routing
+
+### Why ALFRED Is Also an Add-on (Future State)
+
+For production deployment, ALFRED's server should run as an HA add-on (separate Docker container) so it has:
+- Independent process lifecycle for the proactive monitor
+- Own dependencies and Python version
+- Clean separation from HA Core's process
+- Auto-restart on failure
+
+The custom component is lightweight (just an API bridge) while the heavy lifting (LLM proxy, memory, monitoring) lives in the add-on.
+
+Currently during development, ALFRED's server runs on the developer's Mac. The custom component on the HA machine points to the Mac's IP.
 
 ### Why Extract Facts (Not Raw Conversation History)
 
@@ -91,27 +154,7 @@ All of these require only `state_changed` event subscription -- no polling, no c
 
 The home layout (floors, rooms, entities) changes rarely -- when you add a new device, rename a room, or reorganize areas. An event-driven approach would require subscribing to registry change events, which `hass-client` doesn't expose cleanly, and would add complexity for something that changes maybe once a month. Polling every 30 minutes is simple, reliable, and the REST call takes <100ms. The layout is fetched once on startup (so new devices are picked up within 30 minutes at worst).
 
-### Why This Architecture (The Proxy Pattern)
-
-Home Assistant has a native Anthropic/Claude integration (core, since 2024.9.0) that works as a conversation agent. You can set a personality in the Instructions field and it handles device control via the Assist API. But it has two critical gaps:
-
-1. **No persistent memory.** Every conversation starts from zero. Tell it your name, your preferences, your routines -- next session, it's forgotten everything.
-2. **No proactive behavior.** It only responds when spoken to. A JARVIS-like assistant should notice when a door is left open, announce security events, and deliver morning briefings unprompted.
-
-### Alternatives Evaluated
-
-We researched the full HA ecosystem before settling on this design:
-
-| Alternative | Stars | What It Does | Why We Didn't Use It |
-|---|---|---|---|
-| **HA Native Anthropic** | Core | Claude as conversation agent with custom Instructions | No persistent memory, no custom base URL for proxy injection, no proactive behavior |
-| **Home Mind** (hoornet) | 48 | Full AI assistant with cognitive memory via Shodh | TypeScript (not Python), requires Shodh Memory binary, Docker Compose (not HA add-on), no proactive behavior |
-| **PowerLLM** (shulyaka) | 4 | LLM tools including permanent memory | Experimental (4 stars), memory is tool-based (LLM decides when to recall -- adds latency, may miss context) |
-| **openai-compatible-conversation** (michelle-avery) | -- | OpenAI-compatible bridge for HA | **Abandoned** by maintainer, diverged from OpenAI API, limited streaming |
-| **Custom HA Integration** | -- | Build ALFRED as a custom_component | ~800+ lines, need to handle Assist API tool execution loop ourselves |
-| **Standalone App** (original 17-file plan) | -- | Full WebSocket client with own state cache, tool defs, agentic loop | Reinvents everything HA already does. 17 files, ~2000 lines |
-
-### Why the Proxy Approach Wins
+### Why the Proxy Pattern Wins
 
 The proxy sits between HA and Claude. That position gives us something no other approach can:
 
@@ -121,7 +164,7 @@ Compare this to tool-based memory (PowerLLM, MCP): the LLM has to explicitly cal
 
 **Personality is hardcoded, not configurable.** If personality lives in HA's Instructions field, anyone who reconfigures the integration or updates HA could wipe it. In the proxy, ALFRED's persona is always the first thing in the system prompt.
 
-**HA handles all the hard stuff.** Device control, tool definitions, tool execution, the agentic loop, entity states, STT, TTS -- all handled by HA and its HACS component. ALFRED never parses tool calls or manages service calls during conversation.
+**HA handles all the hard stuff.** Device control, tool definitions, entity states, STT, TTS -- all handled by HA. The custom component handles tool execution. ALFRED never parses tool calls or manages service calls during conversation.
 
 ### Ideas Borrowed from Home Mind
 
@@ -130,6 +173,20 @@ Two concepts from the Home Mind project significantly improved our design:
 1. **Home Layout Index.** On startup, ALFRED queries HA's template API with Jinja2 functions (`floors()`, `floor_areas()`, `area_entities()`) to build a compact floor/room/entity map. This is injected into every system prompt, giving Claude spatial awareness without tool calls. Refreshed every 30 minutes.
 
 2. **Personality-first prompt structure.** The ALFRED persona is placed at the very top of the system prompt, giving it maximum authority over Claude's behavior. HA's own system prompt (entity lists, tool instructions) is appended after.
+
+### Alternatives Evaluated
+
+We researched the full HA ecosystem before settling on this design:
+
+| Alternative | Stars | What It Does | Why We Didn't Use It |
+|---|---|---|---|
+| **HA Native Anthropic** | Core | Claude as conversation agent with custom Instructions | No persistent memory, no custom base URL for proxy injection, no proactive behavior |
+| **HA `openai_conversation`** | Core | OpenAI as conversation agent | No `base_url` config -- always hits OpenAI servers, can't redirect to ALFRED |
+| **Custom Conversation** (michelle-avery) | 74 | HACS LLM bridge with multi-provider support | Depends on third-party HACS repo, potential Python 3.14 compat issues |
+| **Home Mind** (hoornet) | 48 | Full AI assistant with cognitive memory via Shodh | TypeScript (not Python), requires Shodh Memory binary, Docker Compose (not HA add-on), no proactive behavior |
+| **PowerLLM** (shulyaka) | 4 | LLM tools including permanent memory | Experimental (4 stars), memory is tool-based (LLM decides when to recall -- adds latency, may miss context) |
+| **openai-compatible-conversation** (michelle-avery) | -- | OpenAI-compatible bridge for HA | **Abandoned** by maintainer, diverged from OpenAI API, limited streaming |
+| **Standalone App** (original 17-file plan) | -- | Full WebSocket client with own state cache, tool defs, agentic loop | Reinvents everything HA already does. 17 files, ~2000 lines |
 
 ---
 
@@ -232,6 +289,7 @@ First Floor
 | Layout refresh interval | 30 minutes (1800s) | `main.py` `layout_refresh_loop()` | Devices change rarely; 30 min is responsive enough |
 | Reconnect delay | 10 seconds | `monitor.py` `start()` | Fast enough to recover, slow enough to not spam a down server |
 | Layout fetch timeout | 10 seconds | `main.py` `fetch_home_layout()` | Prevent hanging if HA is slow |
+| Tool call loop max iterations | 10 | `conversation.py` `MAX_TOOL_ITERATIONS` | Prevent infinite loops if the LLM keeps calling tools |
 
 ### Environment Variables (standalone dev mode)
 
@@ -262,59 +320,78 @@ In add-on mode, `SUPERVISOR_TOKEN` is auto-injected and used for both REST and W
 
 ---
 
-## Architecture Diagram
+## The Custom Component: `alfred_conversation`
 
-```
-User speaks
-    |
-    v
-HA Assist Pipeline (STT)
-    |
-    v
-Custom Conversation (HACS component by michelle-avery)
-    |  Assembles: system prompt + Assist API tools + user message
-    |  Sends: POST /v1/chat/completions (OpenAI format, always streaming)
-    v
-ALFRED server.py (port 5000)
-    |  1. Find user message
-    |  2. Recall relevant memories from SQLite (cosine similarity on embeddings)
-    |  3. Prepend: ALFRED persona + home layout + recalled facts
-    |  4. Forward to Claude Sonnet via LiteLLM (stream=True)
-    |  5. Pipe SSE chunks back to Custom Conversation
-    |  6. Store conversation in background for future fact extraction
-    v
-Claude Sonnet API (Anthropic)
-    |  Returns: text and/or tool_calls (e.g., HassTurnOn)
-    v
-Custom Conversation
-    |  If tool_calls: executes them via HA Core, appends results, loops back to ALFRED
-    |  If text only: done
-    v
-HA Assist Pipeline (TTS) -> Speaker
+### Why It Exists
 
-Separately:
-ALFRED monitor.py
-    |  Connects to HA via hass-client WebSocket
-    |  Subscribes to state_changed events
-    |  Announces via tts.speak on notable events
+HA's native conversation integrations (`openai_conversation`, `anthropic`) don't allow setting a custom `base_url`. They always connect to the official provider endpoints. ALFRED needs the conversation agent to talk to its own server, which enriches prompts with memory and persona before forwarding to Claude.
+
+The `alfred_conversation` custom component is a minimal OpenAI-compatible conversation agent with one key addition: a configurable `base_url` that points to ALFRED's server.
+
+### How It Works
+
+1. **Config flow** (`config_flow.py`): User enters ALFRED's URL during setup. The integration validates connectivity by calling `GET /v1/models`. If it reaches ALFRED and gets back the `alfred-brain` model, setup succeeds.
+
+2. **Init** (`__init__.py`): Creates an `openai.AsyncOpenAI` client pointed at ALFRED's `base_url` with a dummy API key (`"not-needed"` -- ALFRED uses its own Anthropic key). Stores the client as `entry.runtime_data`.
+
+3. **Conversation entity** (`conversation.py`): Registers as a conversation agent in HA. When a user speaks:
+   - Gets HA's Assist tools (entity control functions) from the LLM API
+   - Builds the HA system prompt (entity list, tool instructions)
+   - Sends the request to ALFRED via the OpenAI client (`stream=False`)
+   - If Claude returns `tool_calls`, executes them via `llm_api.async_call_tool()` and loops back
+   - If Claude returns text, returns it as the spoken response
+
+### Files
+
+| File | Lines | Purpose |
+|---|---|---|
+| `manifest.json` | 10 | Integration metadata. Declares `openai>=1.30.0` dependency. |
+| `const.py` | 18 | Constants: domain name, config keys, defaults. |
+| `strings.json` | 17 | UI strings for the config flow. |
+| `__init__.py` | 41 | Entry setup: creates OpenAI client with custom `base_url`. |
+| `config_flow.py` | 81 | Config flow: URL input form, connectivity validation. |
+| `conversation.py` | 273 | Core agent: message handling, tool execution loop. |
+
+### Key Design Decisions in the Custom Component
+
+- **`stream=False`**: The custom component calls ALFRED without streaming. ALFRED's server returns a complete JSON response. This avoids the complexity of parsing SSE chunks inside HA's process and is more reliable for tool call handling. ALFRED still supports streaming for other clients (like direct API testing).
+
+- **No API key needed**: The OpenAI client is created with `api_key="not-needed"`. ALFRED's server doesn't validate API keys -- it uses its own Anthropic key internally.
+
+- **Assist API integration**: The component sets `CONF_LLM_HASS_API: "assist"` in options during setup. This tells HA to provide the full Assist tool set (entity control, automations, scripts) in every conversation.
+
+- **Conversation history**: Maintained in-memory per `conversation_id`. The system prompt is rebuilt fresh each time (to pick up latest HA state), but prior user/assistant messages are preserved within a session.
+
+- **`LLMContext` constructor**: Uses only the parameters available in HA 2026.3.0: `platform`, `context`, `language`, `assistant`, `device_id`. Older parameters like `user_prompt` were removed in this version.
+
+### Deploying the Custom Component
+
+The component files live in `custom_components/alfred_conversation/` on the HA machine at `/config/custom_components/alfred_conversation/`. To deploy:
+
+```bash
+sshpass -p '<password>' scp -r custom_components/alfred_conversation/ \
+  root@homeassistant.local:/config/custom_components/alfred_conversation/
+sshpass -p '<password>' ssh root@homeassistant.local "ha core restart"
 ```
+
+After restart, add the integration via Settings > Devices & Services > Add Integration > "ALFRED Conversation", or create a config entry via the WebSocket API.
 
 ---
 
-## What Each Module Does
+## What Each Module Does (ALFRED Server)
 
-### server.py -- Streaming LLM Proxy (~160 lines)
+### server.py -- LLM Proxy (~170 lines)
 
-Receives OpenAI-format requests from Custom Conversation, enriches the system prompt, forwards to Claude, streams SSE responses back. Three endpoints:
+Receives OpenAI-format requests from the custom component, enriches the system prompt, forwards to Claude, returns responses. Three endpoints:
 
-- `POST /v1/chat/completions` -- The core proxy. Enriches with persona + memory + layout, forwards to Claude via LiteLLM, streams back.
-- `GET /v1/models` -- Returns `alfred-brain` model. Required by Custom Conversation during setup validation.
+- `POST /v1/chat/completions` -- The core proxy. Enriches with persona + memory + layout, forwards to Claude via LiteLLM. Supports both streaming (`stream=true` → SSE) and non-streaming (`stream=false` → JSON) modes.
+- `GET /v1/models` -- Returns `alfred-brain` model. Required by the custom component during setup validation.
 - `GET /health` -- Status check.
 
 Key design decisions:
-- Always streams (Custom Conversation hardcodes `stream=True`, there is no non-streaming path)
-- Ignores the model name from Custom Conversation (`openai/alfred-brain`) and always forwards to Claude Sonnet
-- Memory storage happens in a background task after streaming completes, so it doesn't block the response
+- Respects the `stream` parameter from the request body. When `stream=false` (which the custom component uses), returns a standard OpenAI JSON response. When `stream=true`, returns SSE chunks.
+- Ignores the model name from the caller (e.g., `alfred-brain`) and always forwards to Claude Sonnet
+- Memory storage happens in a background task after the response completes, so it doesn't block
 - HA's Assist API tools are passed through unchanged -- ALFRED never defines or executes tools
 
 ### memory.py -- Persistent Memory (~190 lines)
@@ -328,8 +405,6 @@ Three operations:
 - `store()` -- Saves user/assistant message pair. Every 5 turns, triggers fact extraction in background.
 - `recall()` -- Embeds the user's query with OpenAI `text-embedding-3-small`, computes cosine similarity against all stored fact embeddings, returns top 5 as text.
 - `_extract_facts()` -- Sends recent conversation to Claude Haiku, asks it to extract preferences/facts as a JSON array, embeds each fact, stores in SQLite. Deduplicates against existing facts.
-
-Why SQLite + embeddings instead of a vector database: see "Why SQLite" in the decisions section above.
 
 ### monitor.py -- Proactive Behavior (~230 lines)
 
@@ -349,7 +424,7 @@ Key design decisions:
 - Door reminder tasks are tracked per-entity and cancelled when the door closes
 - Persistent notifications use `domain="persistent_notification", service="create"` (not `domain="notify"`)
 
-### main.py -- Entry Point (~160 lines)
+### main.py -- Entry Point (~170 lines)
 
 Wires everything together:
 
@@ -363,28 +438,6 @@ Wires everything together:
 
 ---
 
-## The HACS Bridge: Custom Conversation
-
-**Why not `openai-compatible-conversation`?** It's abandoned. The maintainer (michelle-avery) explicitly states she no longer uses or supports it. It can't handle the OpenAI Responses API changes and has limited streaming.
-
-**Custom Conversation** (michelle-avery, 74 stars) is the actively maintained replacement. Source code verified:
-
-- Uses LiteLLM internally for multi-provider support
-- Sends standard `POST /v1/chat/completions` with `tools` and `stream: true`
-- Includes `stream_options: {"include_usage": true}`
-- Parses `tool_calls` from SSE delta chunks
-- Executes tool calls via HA's `IntentTool.async_call()`
-- Agentic loop: max 10 iterations, breaks when no unresponded tool results remain
-- Model name arrives prefixed: `"openai/alfred-brain"`
-
-Configuration:
-- Provider: OpenAI
-- Base URL: `http://local-alfred:5000/v1` (internal Docker network)
-- Model: `alfred-brain`
-- API: Assist (enables HA's built-in tool definitions)
-
----
-
 ## Add-on Networking
 
 Verified from the HA Supervisor source code:
@@ -395,20 +448,30 @@ Verified from the HA Supervisor source code:
 - `5000/tcp: null` in config.yaml means the port is available on the internal network only (not exposed to LAN) -- more secure
 - `SUPERVISOR_TOKEN` environment variable is auto-injected into every add-on container
 - From inside an add-on: REST at `http://supervisor/core/api/`, WebSocket at `ws://supervisor/core/websocket`
-- Custom Conversation (running inside the `homeassistant` container) reaches ALFRED at `http://local-alfred:5000/v1`
+- The custom component (running inside the `homeassistant` container) reaches ALFRED at `http://local-alfred:5000/v1` (add-on mode) or `http://<developer-ip>:8099/v1` (dev mode)
 
 ---
 
 ## Dependencies & Why Each Was Chosen
 
+### ALFRED Server
+
 | Package | Version | Why |
 |---|---|---|
-| `litellm` | latest | Translates between OpenAI request format (what Custom Conversation sends) and Anthropic's API. 30k+ GitHub stars, battle-tested. |
+| `litellm` | latest | Translates between OpenAI request format and Anthropic's API. 30k+ GitHub stars, battle-tested. |
 | `openai` | latest | OpenAI Python SDK for embeddings API (`text-embedding-3-small`). Only used for memory recall. |
 | `aiohttp` | latest | HTTP server for the proxy endpoints. Also a dependency of hass-client. |
 | `hass-client` | 1.2.0 | High-level async HA WebSocket client. Used only by monitor.py. Battle-tested by Music Assistant. |
 | `aiosqlite` | latest | Async SQLite wrapper. Non-blocking database operations for memory. |
 | `python-dotenv` | latest | Loads `.env` file for standalone development mode. |
+
+### Custom Component
+
+| Package | Version | Why |
+|---|---|---|
+| `openai` | >=1.30.0 | OpenAI Python SDK used as HTTP client for the OpenAI-compatible API. |
+| `voluptuous` | (HA core) | Schema validation for tool parameters. Pre-installed in HA. |
+| `voluptuous_openapi` | (HA core) | Converts voluptuous schemas to OpenAI function parameter format. Pre-installed in HA. |
 
 ---
 
@@ -417,8 +480,8 @@ Verified from the HA Supervisor source code:
 | Purpose | Model | Why |
 |---|---|---|
 | Conversations | `anthropic/claude-sonnet-4-6` | Primary brain. Handles all user interactions, tool calling decisions, personality. |
-| Fact extraction | `anthropic/claude-haiku-4-5-20251001` | Background task. Extracts preferences from conversation history. Fast and cheap. |
-| Morning briefing | `anthropic/claude-haiku-4-5-20251001` | Generates 2-3 sentence briefings. Doesn't need Sonnet's reasoning. |
+| Fact extraction | `anthropic/claude-haiku-4-5` | Background task. Extracts preferences from conversation history. Fast and cheap. |
+| Morning briefing | `anthropic/claude-haiku-4-5` | Generates 2-3 sentence briefings. Doesn't need Sonnet's reasoning. |
 | Embeddings | `text-embedding-3-small` (OpenAI) | Embeds facts and queries for semantic recall. $0.02/1M tokens. |
 
 ---
@@ -431,12 +494,12 @@ The original plan had 17 Python files and ~2000 lines. Through iterative researc
 |---|---|---|
 | `ws.py` (custom WebSocket) | Eliminated | `hass-client` library handles this |
 | `state.py` (state cache) | Eliminated | HA's Assist API exposes states to the LLM |
-| `control.py` (call_service) | Eliminated | HA executes tool_calls via Custom Conversation |
-| `brain.py` (agentic loop) | Eliminated | Custom Conversation manages the loop (max 10 iterations) |
+| `control.py` (call_service) | Eliminated | HA executes tool_calls via the custom component |
+| `brain.py` (agentic loop) | Eliminated | Custom component manages the loop (max 10 iterations) |
 | `tools.py` (tool definitions) | Eliminated | HA's Assist API auto-generates tools from exposed entities |
 | `prompts.py` (context builder) | Merged into server.py | Just string concatenation |
 | `context.py` | Eliminated | HA provides entity context in the system prompt |
-| `sessions.py` | Eliminated | Custom Conversation manages sessions via `chat_log` |
+| `sessions.py` | Eliminated | Custom component manages sessions via conversation history |
 | `presence.py` | Only in monitor.py | Only needed for proactive announcements |
 | `announcer.py` | Merged into monitor.py | Single `call_service` helper |
 | `security.py` | Merged into monitor.py | Simple event callbacks |
@@ -445,20 +508,125 @@ The original plan had 17 Python files and ~2000 lines. Through iterative researc
 | `routines.py` | Deferred | Automation suggestions are premature |
 | `ha.py` (hass-client wrapper) | Only in monitor.py | Conversations don't need direct HA access |
 
-**Result: 17 files -> 4 files. ~2000 lines -> ~750 lines.**
+**Result: 17 files -> 4 server files + 6 custom component files. ~2000 lines -> ~1100 lines total.**
 
 ---
 
 ## HA Setup Checklist
 
-1. Install **Custom Conversation** via HACS (add `https://github.com/michelle-avery/custom-conversation` as custom repository)
-2. Configure: Provider = OpenAI, Base URL = `http://local-alfred:5000/v1`, API key = anything, Model = `alfred-brain`
-3. Enable **Assist** as the LLM API (Settings > Devices & Services > Custom Conversation > Configure)
-4. Expose entities for ALFRED to control (Settings > Voice assistants > Expose)
-5. Set Custom Conversation as the conversation agent in your Assist pipeline
-6. Install ALFRED add-on (copy `alfred/` to `/addons/` or add this repo as custom add-on repository)
-7. Configure add-on options: Anthropic API key, OpenAI API key, TTS entity, default speaker
-8. Start the add-on
+### For Development (ALFRED Server on Local Machine)
+
+1. **Clone the repo** and create a virtual environment:
+   ```bash
+   python3.13 -m venv .venv && source .venv/bin/activate
+   pip install -r alfred/requirements.txt
+   ```
+
+2. **Create `.env`** in the repo root:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   OPENAI_API_KEY=sk-proj-...
+   HA_URL=http://homeassistant.local:8123
+   HA_TOKEN=<long-lived access token>
+   LITELLM_MODEL=anthropic/claude-sonnet-4-6
+   FACT_EXTRACTION_MODEL=anthropic/claude-haiku-4-5
+   EMBEDDING_MODEL=text-embedding-3-small
+   DB_PATH=./alfred.db
+   ALFRED_PORT=8099
+   ```
+
+3. **Start ALFRED**: `cd alfred && python -m app.main`
+
+4. **Deploy the custom component** to HA:
+   ```bash
+   sshpass -p '<ssh-password>' scp -r \
+     custom_components/alfred_conversation/ \
+     root@homeassistant.local:/config/custom_components/alfred_conversation/
+   ```
+
+5. **Restart HA Core**:
+   ```bash
+   sshpass -p '<ssh-password>' ssh root@homeassistant.local "ha core restart"
+   ```
+
+6. **Add the integration**: Settings > Devices & Services > Add Integration > "ALFRED Conversation". Enter ALFRED's URL (e.g., `http://192.168.68.105:8099/v1`).
+
+7. **Set ALFRED as the conversation agent** in an Assist pipeline (via UI or WebSocket API).
+
+8. **Expose entities** for ALFRED to control: Settings > Voice assistants > Expose.
+
+### Headless Setup (All via API, No UI)
+
+Everything can be configured programmatically:
+
+```python
+# WebSocket: Create config entry
+{"type": "config_entries/flow", "handler": "alfred_conversation", ...}
+
+# WebSocket: Set pipeline agent
+{"type": "assist_pipeline/pipeline/update", "pipeline_id": "...",
+ "conversation_engine": "conversation.alfred", ...}
+
+# WebSocket: Test conversation
+{"type": "conversation/process", "text": "Hello ALFRED",
+ "agent_id": "conversation.alfred"}
+```
+
+### For Production (HA Add-on)
+
+1. Copy `alfred/` to `/addons/` on the HA machine or add the GitHub repo as a custom add-on repository
+2. Install and configure the add-on (API keys, TTS entity, speaker)
+3. Update the custom component's `base_url` from dev IP to `http://local-alfred:5000/v1`
+4. Start the add-on
+
+---
+
+## HA Remote Access Methods
+
+### SSH (Preferred for Headless Operations)
+
+The HA Terminal & SSH add-on (`core_ssh`) exposes port 22. Password is configured in the add-on options.
+
+```bash
+# Execute commands
+sshpass -p '<password>' ssh root@homeassistant.local "ha core restart"
+
+# Transfer files
+sshpass -p '<password>' scp file.py root@homeassistant.local:/config/path/
+
+# View logs
+sshpass -p '<password>' ssh root@homeassistant.local "ha core logs | grep alfred"
+```
+
+### Supervisor API (via WebSocket)
+
+The Supervisor API is accessible through HA's WebSocket under the `supervisor/api` message type:
+
+```json
+{"type": "supervisor/api", "endpoint": "/addons/core_ssh/info", "method": "get"}
+```
+
+Cannot be accessed via REST from outside -- returns 401. The long-lived access token only works through the WebSocket proxy.
+
+### HA REST API
+
+Available for template rendering, state queries, and service calls:
+
+```bash
+curl -H "Authorization: Bearer $HA_TOKEN" \
+  -X POST http://homeassistant.local:8123/api/template \
+  -d '{"template": "{{ states.light.kitchen.state }}"}'
+```
+
+### HA WebSocket API
+
+For real-time operations: conversation testing, config entry management, pipeline configuration, event subscription.
+
+```python
+async with websockets.connect("ws://homeassistant.local:8123/api/websocket") as ws:
+    await ws.send(json.dumps({"type": "auth", "access_token": token}))
+    # ... send commands
+```
 
 ---
 
@@ -466,7 +634,7 @@ The original plan had 17 Python files and ~2000 lines. Through iterative researc
 
 For future reference, these exist in the HA ecosystem and may become relevant:
 
-- **HA Native Anthropic** (core, 2024.9.0+, 1932 installations): If it ever adds custom base URL support, could replace Custom Conversation as the bridge.
+- **HA Native Anthropic** (core, 2024.9.0+, 1932 installations): If it ever adds custom base URL support, could replace the custom component as the bridge.
 - **HA MCP Integration** (core): Model Context Protocol. ALFRED's memory could be exposed as an MCP server for other conversation agents.
 - **PowerLLM** (shulyaka): Permanent memory as an LLM tool. If HA core adds native memory, our memory module could become optional.
 - **Home Mind** (hoornet): If it adds HA add-on packaging and proactive behavior, could be an alternative to ALFRED.
@@ -510,11 +678,11 @@ if text.startswith("```"):
 
 ### SSE Serialization
 
-`chunk.model_dump_json(exclude_none=True)` is critical. Without `exclude_none=True`, LiteLLM's chunk objects include null fields that Custom Conversation's parser may choke on.
+`chunk.model_dump_json(exclude_none=True)` is critical. Without `exclude_none=True`, LiteLLM's chunk objects include null fields that downstream parsers may choke on.
 
 ### Background Task Pattern
 
-Memory storage uses `asyncio.create_task(memory.store(...))` to avoid blocking the SSE response. The task runs after `handle_chat` returns. Same pattern for fact extraction (triggered from `store()`) and morning briefings.
+Memory storage uses `asyncio.create_task(memory.store(...))` to avoid blocking the response. The task runs after `handle_chat` returns. Same pattern for fact extraction (triggered from `store()`) and morning briefings.
 
 ### Config Loading Dual Mode
 
@@ -531,18 +699,46 @@ When the 30-minute door reminder fires, it re-checks the entity state via `get_s
 
 `_briefed_today` stores a date string (`"2026-03-13"`) rather than a boolean. This handles day rollover naturally -- if ALFRED runs for days without restart, it resets automatically at midnight because `_today()` returns a new string.
 
+### Python 3.14 Syntax Restrictions (HA 2026.3.0)
+
+HA 2026.3.0 runs Python 3.14. Key compatibility issue discovered:
+
+```python
+# INVALID in Python 3.14 -- SyntaxError
+messages = [
+    *messages[1:] if messages else [],  # inline conditional unpacking
+    ChatCompletionUserMessageParam(...)
+]
+
+# VALID -- explicit construction
+prior = messages[1:] if messages else []
+new_messages = []
+new_messages.extend(prior)
+new_messages.append(ChatCompletionUserMessageParam(...))
+```
+
+The `*expr if cond else []` syntax inside a list literal is not valid Python 3.14. Always build lists explicitly when conditional unpacking is needed.
+
+### HA 2026.3.0 API Changes
+
+Several HA internal APIs changed from earlier versions:
+
+- `assist_pipeline.async_migrate_engine()` was removed. Do not call it.
+- `llm.LLMContext` constructor no longer accepts a `user_prompt` parameter.
+- `llm.BASE_PROMPT` no longer exists. Use `llm_api.api_prompt` instead.
+
 ---
 
 ## API Wire Formats
 
-### What Custom Conversation Sends to ALFRED
+### What the Custom Component Sends to ALFRED
 
 ```
 POST /v1/chat/completions HTTP/1.1
 Content-Type: application/json
 
 {
-  "model": "openai/alfred-brain",
+  "model": "alfred-brain",
   "messages": [
     {"role": "system", "content": "...HA's Assist instructions + entity list..."},
     {"role": "user", "content": "Turn on the kitchen lights"}
@@ -557,40 +753,78 @@ Content-Type: application/json
       }
     }
   ],
-  "stream": true,
-  "stream_options": {"include_usage": true}
+  "stream": false,
+  "max_tokens": 1024,
+  "temperature": 0.7,
+  "top_p": 1.0,
+  "user": "<conversation_id>"
 }
 ```
 
-Note: ALFRED ignores the `model` field (always forwards to Claude) and `stream_options` (LiteLLM handles it).
+### What ALFRED Returns (Non-Streaming)
 
-### What ALFRED Streams Back
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 1710000000,
+  "model": "claude-sonnet-4-6",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Very well, sir. The kitchen lights are now on."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {"prompt_tokens": 500, "completion_tokens": 20, "total_tokens": 520}
+}
+```
 
-SSE format -- each chunk is a `data:` line followed by two newlines:
+When Claude returns tool calls:
+
+```json
+{
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_123",
+            "type": "function",
+            "function": {
+              "name": "HassTurnOn",
+              "arguments": "{\"name\": \"kitchen lights\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}
+```
+
+The custom component parses `finish_reason: "tool_calls"` to know it should execute tools and loop back.
+
+### What ALFRED Streams Back (When stream=true)
+
+SSE format for other clients (e.g., direct API testing):
 
 ```
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Very"},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"role":"assistant","content":"Very"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" well"},"finish_reason":null}]}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"content":" well"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
-
-When Claude returns tool calls instead of text:
-
-```
-data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_123","type":"function","function":{"name":"HassTurnOn","arguments":""}}]},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"name\":\"kitchen lights\"}"}}]},"finish_reason":null}]}
-
-data: {"id":"chatcmpl-...","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-```
-
-Custom Conversation parses `finish_reason: "tool_calls"` to know it should execute tools and loop back.
 
 ### TTS Service Call Format
 
@@ -598,9 +832,9 @@ Custom Conversation parses `finish_reason: "tool_calls"` to know it should execu
 await client.call_service(
     domain="tts",
     service="speak",
-    target={"entity_id": "tts.google_en_com"},      # TTS platform entity
+    target={"entity_id": "tts.google_en_com"},
     service_data={
-        "media_player_entity_id": "media_player.living_room",  # Speaker
+        "media_player_entity_id": "media_player.living_room",
         "message": "Good morning, sir."
     },
 )
@@ -612,7 +846,7 @@ The `target` is the TTS entity, NOT the media player. The media player goes in `
 
 ```python
 await client.call_service(
-    domain="persistent_notification",  # NOT "notify"
+    domain="persistent_notification",
     service="create",
     service_data={"message": "The front door has been unlocked.", "title": "ALFRED"},
 )
@@ -625,15 +859,15 @@ await client.call_service(
 When LiteLLM fails (Anthropic down, invalid key, etc.), ALFRED returns:
 
 ```json
-HTTP/1.1 502 Bad Gateway
 {"error": {"message": "LLM backend error", "type": "server_error"}}
 ```
+HTTP status 502.
 
 ---
 
 ## Troubleshooting Log
 
-Every error we encountered during development and how it was fixed. Preserved here so the same mistakes aren't repeated.
+Every error encountered during development and how it was fixed. Preserved here so the same mistakes aren't repeated.
 
 ### Port 5000 Occupied by Apple AirTunes (macOS)
 
@@ -667,9 +901,65 @@ Every error we encountered during development and how it was fixed. Preserved he
 
 **Fix**: Created a Python 3.13 virtual environment: `python3.13 -m venv .venv && source .venv/bin/activate && pip install -r alfred/requirements.txt`.
 
+### HA `openai_conversation` Has No `base_url` Config
+
+**Symptom**: After setting up the built-in `openai_conversation` integration, all requests went to OpenAI's servers instead of ALFRED.
+
+**Cause**: HA core's `openai_conversation` integration hardcodes the OpenAI endpoint. There is no `base_url` option in the config flow or options flow.
+
+**Fix**: Abandoned `openai_conversation` entirely. Built the `alfred_conversation` custom component with explicit `base_url` configuration.
+
+### Custom Component Python 3.14 SyntaxError
+
+**Symptom**: `SyntaxError: invalid syntax` at line 173 of `conversation.py` during HA startup.
+
+**Cause**: Python 3.14 (used by HA 2026.3.0) does not allow `*list if condition else []` inline unpacking syntax inside list literals.
+
+**Fix**: Rewrote list construction to use explicit `extend()` / `append()` calls instead of conditional unpacking.
+
+### Custom Component `async_migrate_engine` AttributeError
+
+**Symptom**: `AttributeError: module 'homeassistant.components.assist_pipeline' has no attribute 'async_migrate_engine'` during entity registration.
+
+**Cause**: The `async_migrate_engine` function was removed from HA's `assist_pipeline` module in a recent version.
+
+**Fix**: Removed the call entirely. Pipeline agent assignment is done separately via the WebSocket API or UI.
+
+### Custom Component `LLMContext` Constructor Error
+
+**Symptom**: `TypeError` when constructing `llm.LLMContext` with a `user_prompt` parameter.
+
+**Cause**: HA 2026.3.0 removed the `user_prompt` parameter from `LLMContext.__init__`.
+
+**Fix**: Removed `user_prompt` from the constructor call.
+
+### Custom Component `llm.BASE_PROMPT` Not Found
+
+**Symptom**: `AttributeError: module 'homeassistant.helpers.llm' has no attribute 'BASE_PROMPT'`
+
+**Cause**: `llm.BASE_PROMPT` was removed in HA 2026.3.0.
+
+**Fix**: Use `llm_api.api_prompt` instead, which contains the full Assist system prompt.
+
+### ALFRED Server Returning String Instead of Object
+
+**Symptom**: `AttributeError: 'str' object has no attribute 'choices'` in the custom component.
+
+**Cause**: ALFRED's server always used `stream=True` when calling Claude via LiteLLM, but the custom component called ALFRED with `stream=False`. The OpenAI Python client received SSE text where it expected JSON and returned a raw string.
+
+**Fix**: Made `server.py` respect the `stream` parameter from the request body. When `stream=false`, calls LiteLLM with `stream=False` and returns `web.json_response(result)` instead of SSE.
+
+### Supervisor API Returns 401 from External REST Calls
+
+**Symptom**: `curl` to `http://homeassistant.local:8123/api/hassio/addons/core_ssh/info` returns HTTP 401.
+
+**Cause**: The HA long-lived access token works for HA REST/WebSocket APIs but NOT for Supervisor REST endpoints when called from outside. The Supervisor API requires the `SUPERVISOR_TOKEN` which is only available inside add-on containers.
+
+**Fix**: Access Supervisor API through HA's WebSocket proxy using the `supervisor/api` message type, or use SSH to the HA machine.
+
 ### Custom Repo Hostname Change
 
-**Note (not yet encountered, but documented in plan)**: When the add-on is installed from a custom GitHub repository (not copied to `/addons/`), the Docker hostname changes from `local-alfred` to `{hash}-alfred`. The correct hostname is visible on the add-on info page in HA. Custom Conversation's base URL must be updated accordingly.
+**Note (not yet encountered, but documented)**: When the add-on is installed from a custom GitHub repository (not copied to `/addons/`), the Docker hostname changes from `local-alfred` to `{hash}-alfred`. The correct hostname is visible on the add-on info page in HA. The custom component's base URL must be updated accordingly.
 
 ---
 
@@ -687,7 +977,7 @@ To run ALFRED outside of Home Assistant (on your Mac/Linux):
    HA_URL=http://homeassistant.local:8123
    HA_TOKEN=<long-lived access token from HA>
    LITELLM_MODEL=anthropic/claude-sonnet-4-6
-   FACT_EXTRACTION_MODEL=anthropic/claude-haiku-4-5-20251001
+   FACT_EXTRACTION_MODEL=anthropic/claude-haiku-4-5
    EMBEDDING_MODEL=text-embedding-3-small
    DB_PATH=./alfred.db
    ALFRED_PORT=8099
@@ -695,7 +985,7 @@ To run ALFRED outside of Home Assistant (on your Mac/Linux):
 5. **Run**: `python -m app.main` from the `alfred/` directory
 6. **Test**: `curl http://127.0.0.1:8099/health`
 
-The HA long-lived access token is created in HA: Profile → Security → Long-Lived Access Tokens → Create Token.
+The HA long-lived access token is created in HA: Profile > Security > Long-Lived Access Tokens > Create Token.
 
 Port 8099 avoids the macOS AirTunes conflict on port 5000.
 
@@ -726,8 +1016,17 @@ ALFRED/
 ├── .gitignore
 ├── repository.yaml             # HA add-on repo metadata
 ├── docs/
-│   └── ARCHITECTURE.md         # This file
-└── alfred/                     # Add-on root
+│   ├── ARCHITECTURE.md         # This file
+│   └── ALFRED.postman_collection.json  # Postman API tests
+├── custom_components/
+│   └── alfred_conversation/    # HA custom integration (deployed to /config/)
+│       ├── __init__.py         # Entry setup, OpenAI client creation
+│       ├── config_flow.py      # Config UI: URL input, connectivity check
+│       ├── const.py            # Constants and defaults
+│       ├── conversation.py     # Conversation agent, tool execution loop
+│       ├── manifest.json       # Integration metadata
+│       └── strings.json        # UI localization strings
+└── alfred/                     # Server (runs as add-on or standalone)
     ├── config.yaml             # Add-on metadata, permissions, options
     ├── build.yaml              # Multi-arch Docker base images
     ├── Dockerfile              # Container build
@@ -735,7 +1034,68 @@ ALFRED/
     └── app/
         ├── __init__.py
         ├── main.py             # Entry point, config, layout refresh
-        ├── server.py           # Streaming LLM proxy
+        ├── server.py           # LLM proxy (streaming + non-streaming)
         ├── memory.py           # SQLite + embeddings memory
         └── monitor.py          # Proactive event monitor
 ```
+
+---
+
+## Testing ALFRED
+
+### Quick Health Check
+
+```bash
+curl http://localhost:8099/health
+```
+
+### Direct API Test (Non-Streaming)
+
+```bash
+curl -X POST http://localhost:8099/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "alfred-brain",
+    "messages": [{"role": "user", "content": "Hello ALFRED"}],
+    "stream": false
+  }'
+```
+
+### Direct API Test (Streaming)
+
+```bash
+curl -X POST http://localhost:8099/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "alfred-brain",
+    "messages": [{"role": "user", "content": "Hello ALFRED"}],
+    "stream": true
+  }'
+```
+
+### End-to-End via HA WebSocket
+
+```python
+import asyncio, json, websockets
+
+async def test():
+    async with websockets.connect("ws://homeassistant.local:8123/api/websocket") as ws:
+        await ws.recv()  # auth_required
+        await ws.send(json.dumps({"type": "auth", "access_token": "<token>"}))
+        await ws.recv()  # auth_ok
+
+        await ws.send(json.dumps({
+            "id": 1,
+            "type": "conversation/process",
+            "text": "Hello ALFRED, introduce yourself.",
+            "agent_id": "conversation.alfred"
+        }))
+        result = json.loads(await ws.recv())
+        print(result["result"]["response"]["speech"]["plain"]["speech"])
+
+asyncio.run(test())
+```
+
+### Postman
+
+A full Postman collection is available at `docs/ALFRED.postman_collection.json` with all endpoints pre-configured.
