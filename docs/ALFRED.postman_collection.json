@@ -1,0 +1,236 @@
+{
+	"info": {
+		"name": "ALFRED API",
+		"description": "ALFRED — JARVIS-like AI butler for Home Assistant.\n\nBase URL: http://127.0.0.1:8099\n\nALFRED is a streaming OpenAI-compatible proxy that enriches requests with personality, memory, and home layout before forwarding to Claude Sonnet.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://127.0.0.1:8099",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health Check",
+			"item": [
+				{
+					"name": "GET /health",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/health",
+							"host": ["{{base_url}}"],
+							"path": ["health"]
+						},
+						"description": "Returns server status, version, and configured LLM model. Use this to verify ALFRED is running."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"status\": \"ok\",\n  \"version\": \"0.1.0\",\n  \"model\": \"anthropic/claude-sonnet-4-6\"\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Models",
+			"item": [
+				{
+					"name": "GET /v1/models",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/v1/models",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "models"]
+						},
+						"description": "Lists available models. Returns 'alfred-brain' — the model ID that Custom Conversation uses during setup validation. This is a dummy endpoint; ALFRED always forwards to Claude Sonnet regardless of model name."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"id\": \"alfred-brain\",\n      \"object\": \"model\",\n      \"created\": 1773490660,\n      \"owned_by\": \"alfred\"\n    }\n  ]\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Chat Completions",
+			"item": [
+				{
+					"name": "Simple Message",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello, who are you?\"\n    }\n  ],\n  \"stream\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Basic conversation test. ALFRED will respond in character as a British butler. The response is SSE (Server-Sent Events) streamed. Each chunk is a 'data:' line with an OpenAI-format JSON object. Stream ends with 'data: [DONE]'."
+					},
+					"response": []
+				},
+				{
+					"name": "Ask About Home Layout",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What rooms do I have on the first floor?\"\n    }\n  ],\n  \"stream\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Tests that the Home Layout Index is being injected. ALFRED should know your floors, rooms, and which devices are where — without you telling it. The layout is fetched from HA's template API on startup."
+					},
+					"response": []
+				},
+				{
+					"name": "Store a Preference (Memory Test)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"My name is Salih and I prefer the thermostat at 72 degrees\"\n    }\n  ],\n  \"stream\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Tests memory storage. ALFRED stores this conversation in SQLite. After 5 conversations, it extracts facts like 'User's name is Salih' and 'User prefers thermostat at 72°F' using Claude Haiku, embeds them, and stores for future semantic recall."
+					},
+					"response": []
+				},
+				{
+					"name": "Recall Memory",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What temperature do I like?\"\n    }\n  ],\n  \"stream\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Tests memory recall. If you previously stored a preference (and enough conversations have occurred for fact extraction), ALFRED should remember it via semantic similarity search. Note: facts are extracted every 5 conversations, so you may need to send several messages first."
+					},
+					"response": []
+				},
+				{
+					"name": "With System Prompt (Simulates Custom Conversation)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a helpful assistant. The following tools are available for controlling the smart home.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Turn on the kitchen lights\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"HassTurnOn\",\n        \"description\": \"Turns on a device or entity\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"name\": {\n              \"type\": \"string\",\n              \"description\": \"Name of the device to turn on\"\n            },\n            \"area\": {\n              \"type\": \"string\",\n              \"description\": \"Area/room where the device is located\"\n            }\n          },\n          \"required\": [\"name\"]\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"HassTurnOff\",\n        \"description\": \"Turns off a device or entity\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"name\": {\n              \"type\": \"string\",\n              \"description\": \"Name of the device to turn off\"\n            },\n            \"area\": {\n              \"type\": \"string\",\n              \"description\": \"Area/room where the device is located\"\n            }\n          },\n          \"required\": [\"name\"]\n        }\n      }\n    },\n    {\n      \"type\": \"function\",\n      \"function\": {\n        \"name\": \"HassGetState\",\n        \"description\": \"Gets the current state of a device or entity\",\n        \"parameters\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"name\": {\n              \"type\": \"string\",\n              \"description\": \"Name of the device to check\"\n            },\n            \"area\": {\n              \"type\": \"string\",\n              \"description\": \"Area/room where the device is located\"\n            }\n          },\n          \"required\": [\"name\"]\n        }\n      }\n    }\n  ],\n  \"stream\": true,\n  \"stream_options\": {\n    \"include_usage\": true\n  }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Simulates what Custom Conversation actually sends to ALFRED. Includes:\n- A system prompt (ALFRED prepends its persona + memory + layout before this)\n- HA Assist API tools (HassTurnOn, HassTurnOff, HassGetState)\n- stream: true (always)\n- stream_options with include_usage (Custom Conversation sends this)\n\nClaude should respond with a tool_call (HassTurnOn for kitchen lights). In the real pipeline, Custom Conversation would execute this and loop back. Here you'll just see the raw tool_call in the SSE stream.\n\nLook for 'finish_reason': 'tool_calls' in the final chunk — that's how Custom Conversation knows to execute tools."
+					},
+					"response": []
+				},
+				{
+					"name": "Multi-turn Conversation",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What's the weather like?\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"Currently it's partly cloudy at 65°F, sir. Pleasant enough for the season.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Should I take a jacket?\"\n    }\n  ],\n  \"stream\": true\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "Tests multi-turn conversation. Includes previous messages in the conversation history. In the real pipeline, Custom Conversation manages the conversation history — here we simulate it manually."
+					},
+					"response": []
+				},
+				{
+					"name": "Non-Streaming (falls back to streaming)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"model\": \"openai/alfred-brain\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What time is it?\"\n    }\n  ],\n  \"stream\": false\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/v1/chat/completions",
+							"host": ["{{base_url}}"],
+							"path": ["v1", "chat", "completions"]
+						},
+						"description": "ALFRED always streams regardless of this flag. Custom Conversation always sends stream:true, but this tests that ALFRED handles the stream:false case gracefully (it still streams SSE back)."
+					},
+					"response": []
+				}
+			]
+		}
+	]
+}
